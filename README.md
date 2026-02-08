@@ -76,9 +76,28 @@ Once you confirm the correct port settings and any working command examples from
 
 Please share the confirmed **baud rate**, **parity**, **stop bits**, and any **known query commands** (or register map) from the manual so we can implement the proper protocol in the next iteration.
 
+## Photo-Based OCR Prototype
+
+If you have a USB camera pointed at the pressure/temperature displays, you can use the OCR prototype to extract numbers from a snapshot. The implementation uses lightweight HSV color filtering and seven-segment decoding (no GPU required).
+
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Run on a sample image
+
+```bash
+python pressure_ocr.py --image test_photo.jpg
+```
+
+This prints both pressure (blue digits) and temperature (red digits) with a confidence estimate.
+
 ## Files
 
 - `hrc110_cli.py` — Minimal USB serial CLI for connection testing.
+- `pressure_ocr.py` — Prototype OCR for reading pressure and temperature from a photo.
 - `requirements.txt` — Python dependencies.
 - `environment.yml` — Conda environment definition.
 - `docs/` — Vendor documentation (manuals/appendices).
