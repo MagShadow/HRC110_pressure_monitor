@@ -52,10 +52,17 @@ You can still run OCR directly on a photo:
 python pressure_ocr.py --image test_photo.jpg
 ```
 
+## Experimental Gemini OCR (not wired into the GUI yet)
+
+An optional Gemini-based OCR prototype is available for comparison. See
+`docs/gemini_ocr.md` for setup, batch testing, and per-request cost calculation.
+
 ## Files
 
 - `pressure_monitor_gui.py` — GUI app for monitoring pressure and sending alarms.
 - `pressure_ocr.py` — OCR pipeline for reading pressure/temperature from a photo.
+- `pressure_ocr_gemini.py` — Experimental Gemini-based OCR (not integrated yet).
+- `gemini_ocr_test.py` — Batch test helper for `tests_photos`.
 - `hrc110_cli.py` — USB serial CLI for connection testing.
 - `requirements.txt` — Python dependencies.
 - `environment.yml` — Conda environment definition.
