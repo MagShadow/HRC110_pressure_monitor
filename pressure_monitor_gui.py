@@ -233,9 +233,12 @@ class PressureMonitorApp:
         self._log_status("Testing camera...")
         self._update_status("Testing camera")
         try:
-            reading = self._capture_and_ocr()
+            reading = self._capture_and_ocr(keep_photo=True)
         except Exception as exc:
-            messagebox.showerror("Camera/OCR error", str(exc))
+            messagebox.showerror(
+                "Camera/OCR error",
+                f"{exc}\n\nLast capture saved to data/last_capture.jpg (if available).",
+            )
             self._update_status("Camera test failed")
             return
         if reading is not None:
@@ -304,7 +307,7 @@ class PressureMonitorApp:
             self._check_alarm(value)
         self._schedule_next_run()
 
-    def _capture_and_ocr(self) -> float | None:
+    def _capture_and_ocr(self, keep_photo: bool = False) -> float | None:
         camera_index = int(self.camera_var.get())
         capture = cv2.VideoCapture(camera_index)
         if not capture.isOpened():
@@ -317,22 +320,38 @@ class PressureMonitorApp:
         timestamp = dt.datetime.now()
         self._log_status(f"Photo captured at {timestamp:%Y-%m-%d %H:%M:%S}")
 
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-            temp_path = temp_file.name
-        cv2.imwrite(temp_path, frame)
+        temp_path = None
+        keep_path = None
+        if keep_photo:
+            if not os.path.exists(DATA_DIR):
+                os.makedirs(DATA_DIR)
+            keep_path = os.path.join(DATA_DIR, "last_capture.jpg")
+            cv2.imwrite(keep_path, frame)
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+                temp_path = temp_file.name
+            cv2.imwrite(temp_path, frame)
+
+        image_path = keep_path or temp_path
+        if not image_path:
+            raise RuntimeError("Unable to create capture image")
 
         self._update_status("Running OCR")
         try:
-            pressure, _temperature = read_pressure_temperature(temp_path)
+            pressure, _temperature = read_pressure_temperature(image_path)
             value = float(pressure.value)
             self._log_status(
                 f"OCR result: {pressure.value} (confidence={pressure.confidence:.2f})"
             )
         finally:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+        if keep_path:
+            self._log_status(f"Saved capture to {keep_path}")
 
         return value
 

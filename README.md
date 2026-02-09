@@ -38,6 +38,7 @@ python pressure_monitor_gui.py
 ## GUI Usage Notes
 
 - **Camera test** captures a photo and runs OCR immediately.
+- **Test captures** are saved to `data/last_capture.jpg` so you can inspect failed OCR images.
 - **Monitoring interval** is in minutes (minimum 2).
 - **Data logging**: readings are appended to `data/pressure_readings.csv`.
 - **Alarms**: set low/high thresholds and SMTP details to receive alert emails.
