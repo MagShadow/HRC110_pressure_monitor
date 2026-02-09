@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GUI monitor for HRC-100/110 pressure OCR readings."""
+"""PySide6 GUI monitor for HRC-100/110 pressure OCR readings."""
 
 from __future__ import annotations
 
@@ -7,19 +7,41 @@ import csv
 import datetime as dt
 import json
 import os
+import re
 import smtplib
 import ssl
 import tempfile
-import tkinter as tk
 from dataclasses import dataclass
 from email.message import EmailMessage
-from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
 
 import cv2
-import matplotlib.dates as mdates
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+import pyqtgraph as pg
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QPlainTextEdit,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
 from pressure_ocr import read_pressure_temperature
+
 try:
     from pressure_ocr_gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL
     from pressure_ocr_gemini import read_gemini_ocr
@@ -30,30 +52,42 @@ except Exception as exc:  # pragma: no cover - optional runtime dependency
 else:
     _GEMINI_IMPORT_ERROR = None
 
+try:
+    import keyring  # type: ignore
+except Exception:  # pragma: no cover - optional secure storage
+    keyring = None
+
+
 MIN_INTERVAL_MINUTES = 1
 DEFAULT_INTERVAL_MINUTES = 10
-DATA_DIR = "data"
-CSV_NAME = "pressure_readings.csv"
-STATUS_LOG_NAME = "pressure_status.log"
-CONFIG_NAME = "monitor_config.json"
+DATA_DIR = Path("data")
+DEFAULT_LOG_DIR = DATA_DIR / "logs"
+DEFAULT_CONFIG_PATH = DATA_DIR / "monitor_config.json"
 OCR_METHOD_LOCAL = "Local"
 OCR_METHOD_GEMINI = "GEMINI"
 OCR_METHODS = (OCR_METHOD_LOCAL, OCR_METHOD_GEMINI)
-BG_COLOR = "#ECECEA"
-SECTION_BG = "#E5E4E0"
-STATUS_BG = "#FFFFFF"
-STATUS_FG = "#1F1F1F"
-ALERT_COLOR = "#B5322E"
+KEYRING_SERVICE = "HRC110_pressure_monitor"
+KEYRING_USERNAME = "gemini_api_key"
+
+
+class DateAxisItem(pg.DateAxisItem):
+    """Date axis with explicit absolute timestamp labels."""
+
+    def tickStrings(self, values, scale, spacing):  # type: ignore[override]
+        labels: list[str] = []
+        for value in values:
+            labels.append(dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S"))
+        return labels
 
 
 @dataclass
 class AlarmConfig:
     enabled: bool
-    beep_enabled: bool
-    email_enabled: bool
     low_threshold: float | None
     high_threshold: float | None
-    recipient: str
+    beep_enabled: bool
+    email_enabled: bool
+    recipient_text: str
     sender: str
     smtp_server: str
     smtp_port: int
@@ -62,288 +96,216 @@ class AlarmConfig:
     use_tls: bool
 
 
-class PressureMonitorApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("HRC-110 Pressure Monitor")
-        self.root.configure(bg=BG_COLOR)
+class PressureMonitorWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("HRC-110 Pressure Monitor")
+        self.resize(1260, 800)
 
         self.monitoring = False
-        self.after_id: str | None = None
-        self.timestamps: list[dt.datetime] = []
-        self.values: list[float] = []
-        self.last_alarm_active = False
-        self.last_alarm_sent: dt.datetime | None = None
-        self.gemini_total_cost_usd = 0.0
-        self.reading_log_path = os.path.join(DATA_DIR, CSV_NAME)
-        self.status_log_path = os.path.join(DATA_DIR, STATUS_LOG_NAME)
-        self.config_path = os.path.join(DATA_DIR, CONFIG_NAME)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._run_cycle)
 
-        self._configure_styles()
-        self._build_layout()
+        self.time_data: list[float] = []
+        self.value_data: list[float] = []
+        self.last_alarm_active = False
+        self.gemini_total_cost_usd = 0.0
+
+        self.active_reading_log_path: Path | None = None
+        self.active_status_log_path: Path | None = None
+        self.config_path = DEFAULT_CONFIG_PATH
+
+        self._build_ui()
+        self._build_email_dialog()
         self._refresh_cameras()
         self._load_config_from_path(self.config_path, silent=True)
+        self._load_gemini_api_key_from_keyring()
         self._update_gemini_cost_label()
 
-    def _configure_styles(self) -> None:
-        style = ttk.Style(self.root)
-        self.root.option_add("*Font", "{Segoe UI} 10")
-        style.configure("TFrame", background=BG_COLOR)
-        style.configure("TLabel", background=BG_COLOR, foreground="#202020")
-        style.configure("TButton", padding=(8, 4))
-        style.configure("TLabelframe", background=SECTION_BG, borderwidth=1, relief="solid")
-        style.configure(
-            "TLabelframe.Label",
-            background=SECTION_BG,
-            foreground="#202020",
-            font=("{Segoe UI}", 10, "bold"),
-        )
-        style.configure("Value.TLabel", font=("{Segoe UI}", 30, "bold"), foreground=ALERT_COLOR)
-        style.configure("Secondary.TLabel", foreground="#3A3A3A")
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        main_layout = QHBoxLayout(central)
+        left_layout = QVBoxLayout()
+        right_layout = QVBoxLayout()
+        main_layout.addLayout(left_layout, 1)
+        main_layout.addLayout(right_layout, 2)
 
-    def _build_layout(self) -> None:
-        main = ttk.Frame(self.root, padding=10)
-        main.grid(row=0, column=0, sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.camera_group = QGroupBox("Camera")
+        camera_layout = QGridLayout(self.camera_group)
 
-        left = ttk.Frame(main)
-        right = ttk.Frame(main)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        right.grid(row=0, column=1, sticky="nsew")
-        main.columnconfigure(0, weight=0)
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(0, weight=1)
+        self.camera_combo = QComboBox()
+        self.refresh_camera_btn = QPushButton("Refresh")
+        self.refresh_camera_btn.clicked.connect(self._refresh_cameras)
 
-        self._build_camera_panel(left)
-        self._build_alarm_panel(left)
-        self._build_reading_panel(right)
+        self.ocr_method_combo = QComboBox()
+        self.ocr_method_combo.addItems(list(OCR_METHODS))
+        self.ocr_method_combo.currentTextChanged.connect(lambda _text: self._update_gemini_cost_label())
 
-    def _build_camera_panel(self, parent: ttk.Frame) -> None:
-        camera_frame = ttk.LabelFrame(parent, text="Camera", padding=10)
-        camera_frame.grid(row=0, column=0, sticky="ew")
-        parent.columnconfigure(0, weight=1)
-        camera_frame.columnconfigure(1, weight=1)
-        camera_frame.columnconfigure(2, weight=1)
+        self.gemini_api_key_edit = QLineEdit()
+        self.gemini_api_key_edit.setEchoMode(QLineEdit.Password)
 
-        ttk.Label(camera_frame, text="Select camera index:").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.camera_var = tk.StringVar()
-        self.camera_combo = ttk.Combobox(
-            camera_frame, textvariable=self.camera_var, state="readonly", width=12
-        )
-        self.camera_combo.grid(row=0, column=1, padx=(5, 0))
-        ttk.Button(
-            camera_frame, text="Refresh", command=self._refresh_cameras
-        ).grid(row=0, column=2, padx=(5, 0))
+        self.remember_key_check = QCheckBox("Remember API key (encrypted)")
+        if keyring is None:
+            self.remember_key_check.setEnabled(False)
+            self.remember_key_check.setToolTip("keyring is unavailable in this environment")
+        self.remember_key_check.toggled.connect(self._on_remember_key_toggled)
 
-        ttk.Label(camera_frame, text="OCR method:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.ocr_method_var = tk.StringVar(value=OCR_METHOD_LOCAL)
-        self.ocr_method_combo = ttk.Combobox(
-            camera_frame,
-            textvariable=self.ocr_method_var,
-            values=OCR_METHODS,
-            state="readonly",
-            width=12,
-        )
-        self.ocr_method_combo.grid(row=1, column=1, padx=(5, 0), pady=(8, 0), sticky="w")
-        self.ocr_method_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_gemini_cost_label())
+        self.test_camera_btn = QPushButton("Test Camera")
+        self.test_camera_btn.clicked.connect(self._test_camera)
+        self.test_ocr_btn = QPushButton("Test OCR")
+        self.test_ocr_btn.clicked.connect(self._test_ocr)
 
-        ttk.Label(camera_frame, text="Gemini API key:").grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
-        )
-        self.gemini_api_key_var = tk.StringVar(value=os.getenv("GEMINI_API_KEY", ""))
-        ttk.Entry(
-            camera_frame, textvariable=self.gemini_api_key_var, width=28, show="*"
-        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=(8, 0))
+        self.camera_status = QLabel("")
 
-        test_row = ttk.Frame(camera_frame)
-        test_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        test_row.columnconfigure(0, weight=1)
-        test_row.columnconfigure(1, weight=1)
-        ttk.Button(test_row, text="Test Camera", command=self._test_camera).grid(
-            row=0, column=0, sticky="ew", padx=(0, 3)
-        )
-        ttk.Button(
-            test_row, text="Test OCR", command=self._test_ocr
-        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        camera_layout.addWidget(QLabel("Select camera index:"), 0, 0)
+        camera_layout.addWidget(self.camera_combo, 0, 1)
+        camera_layout.addWidget(self.refresh_camera_btn, 0, 2)
+        camera_layout.addWidget(QLabel("OCR method:"), 1, 0)
+        camera_layout.addWidget(self.ocr_method_combo, 1, 1)
+        camera_layout.addWidget(QLabel("Gemini API key:"), 2, 0)
+        camera_layout.addWidget(self.gemini_api_key_edit, 2, 1, 1, 2)
+        camera_layout.addWidget(self.remember_key_check, 3, 0, 1, 3)
+        camera_layout.addWidget(self.test_camera_btn, 4, 0, 1, 2)
+        camera_layout.addWidget(self.test_ocr_btn, 4, 2)
+        camera_layout.addWidget(self.camera_status, 5, 0, 1, 3)
 
-        self.camera_status = ttk.Label(camera_frame, text="")
-        self.camera_status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.alarm_group = QGroupBox("Alarm & Logging")
+        alarm_layout = QGridLayout(self.alarm_group)
 
-    def _build_alarm_panel(self, parent: ttk.Frame) -> None:
-        alarm_frame = ttk.LabelFrame(parent, text="Alarm & Email", padding=10)
-        alarm_frame.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        parent.rowconfigure(1, weight=1)
-        alarm_frame.columnconfigure(1, weight=1)
+        self.log_folder_edit = QLineEdit(str(DEFAULT_LOG_DIR))
+        self.log_folder_browse_btn = QPushButton("Browse")
+        self.log_folder_browse_btn.clicked.connect(self._browse_log_folder)
 
-        ttk.Label(alarm_frame, text="Reading log file:").grid(row=0, column=0, sticky="w")
-        self.reading_log_var = tk.StringVar(value=self.reading_log_path)
-        ttk.Entry(alarm_frame, textvariable=self.reading_log_var, width=24).grid(
-            row=0, column=1, sticky="ew"
-        )
-        ttk.Button(alarm_frame, text="Browse", command=self._browse_reading_log_file).grid(
-            row=0, column=2, padx=(6, 0)
-        )
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(MIN_INTERVAL_MINUTES, 24 * 60)
+        self.interval_spin.setValue(DEFAULT_INTERVAL_MINUTES)
+        self.interval_spin.setSuffix(" min")
 
-        ttk.Label(alarm_frame, text="Status log file:").grid(
-            row=1, column=0, sticky="w"
-        )
-        self.status_log_var = tk.StringVar(value=self.status_log_path)
-        ttk.Entry(alarm_frame, textvariable=self.status_log_var, width=24).grid(
-            row=1, column=1, sticky="ew", pady=(4, 0)
-        )
-        ttk.Button(alarm_frame, text="Browse", command=self._browse_status_log_file).grid(
-            row=1, column=2, padx=(6, 0), pady=(4, 0)
-        )
+        self.alarm_enabled_check = QCheckBox("Enable alarm")
+        self.low_enabled_check = QCheckBox("Low threshold")
+        self.low_threshold_spin = pg.SpinBox(value=0.0, bounds=(-1000.0, 10000.0), step=0.01)
+        self.high_enabled_check = QCheckBox("High threshold")
+        self.high_threshold_spin = pg.SpinBox(value=0.0, bounds=(-1000.0, 10000.0), step=0.01)
 
-        ttk.Label(alarm_frame, text="Interval (minutes):").grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
-        )
-        self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MINUTES))
-        ttk.Entry(alarm_frame, textvariable=self.interval_var, width=10).grid(
-            row=2, column=1, sticky="w", pady=(8, 0)
-        )
-        ttk.Label(alarm_frame, text=f"(min {MIN_INTERVAL_MINUTES})").grid(
-            row=2, column=2, sticky="w", pady=(8, 0)
-        )
+        self.beep_alarm_check = QCheckBox("Beep alarm")
+        self.beep_alarm_check.setChecked(True)
+        self.email_alarm_check = QCheckBox("Email alarm")
+        self.email_settings_btn = QPushButton("Email Settings...")
+        self.email_settings_btn.clicked.connect(self._open_email_settings_dialog)
 
-        self.alarm_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            alarm_frame, text="Enable alarm", variable=self.alarm_enabled_var
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.load_config_btn = QPushButton("Load Config")
+        self.load_config_btn.clicked.connect(self._load_config)
+        self.save_config_btn = QPushButton("Save Config")
+        self.save_config_btn.clicked.connect(self._save_config)
 
-        self.beep_alarm_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            alarm_frame, text="Beep alarm", variable=self.beep_alarm_var
-        ).grid(row=4, column=0, sticky="w")
+        self.start_btn = QPushButton("Start")
+        self.start_btn.clicked.connect(self._start_monitoring)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self._stop_monitoring)
 
-        self.email_alarm_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            alarm_frame, text="Email alarm", variable=self.email_alarm_var
-        ).grid(row=4, column=1, sticky="w")
+        alarm_layout.addWidget(QLabel("Log folder:"), 0, 0)
+        alarm_layout.addWidget(self.log_folder_edit, 0, 1)
+        alarm_layout.addWidget(self.log_folder_browse_btn, 0, 2)
+        alarm_layout.addWidget(QLabel("Interval:"), 1, 0)
+        alarm_layout.addWidget(self.interval_spin, 1, 1)
+        alarm_layout.addWidget(self.alarm_enabled_check, 2, 0, 1, 3)
+        alarm_layout.addWidget(self.low_enabled_check, 3, 0)
+        alarm_layout.addWidget(self.low_threshold_spin, 3, 1)
+        alarm_layout.addWidget(self.high_enabled_check, 4, 0)
+        alarm_layout.addWidget(self.high_threshold_spin, 4, 1)
+        alarm_layout.addWidget(self.beep_alarm_check, 5, 0)
+        alarm_layout.addWidget(self.email_alarm_check, 5, 1)
+        alarm_layout.addWidget(self.email_settings_btn, 5, 2)
+        alarm_layout.addWidget(self.load_config_btn, 6, 0)
+        alarm_layout.addWidget(self.save_config_btn, 6, 1)
+        alarm_layout.addWidget(self.start_btn, 7, 0)
+        alarm_layout.addWidget(self.stop_btn, 7, 1)
 
-        ttk.Label(alarm_frame, text="Low threshold:").grid(row=5, column=0, sticky="w")
-        self.low_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.low_var, width=10).grid(
-            row=5, column=1, sticky="w"
-        )
+        self.readout_group = QGroupBox("Pressure Reading")
+        readout_layout = QVBoxLayout(self.readout_group)
 
-        ttk.Label(alarm_frame, text="High threshold:").grid(row=6, column=0, sticky="w")
-        self.high_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.high_var, width=10).grid(
-            row=6, column=1, sticky="w"
-        )
+        self.current_value_label = QLabel("--")
+        self.current_value_label.setStyleSheet("color: #b42318; font-size: 36px; font-weight: 700;")
+        self.status_label = QLabel("Idle")
+        self.gemini_cost_label = QLabel("Gemini total cost (since start): n/a")
 
-        ttk.Label(alarm_frame, text="Email recipient:").grid(
-            row=7, column=0, sticky="w", pady=(8, 0)
-        )
-        self.recipient_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.recipient_var, width=24).grid(
-            row=7, column=1, columnspan=2, sticky="ew", pady=(8, 0)
-        )
+        self.plot_widget = pg.PlotWidget(axisItems={"bottom": DateAxisItem()})
+        self.plot_widget.setBackground("w")
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("bottom", "Time", color="k")
+        self.plot_widget.setLabel("left", "Pressure", color="k")
+        self.plot_widget.getAxis("bottom").setTextPen(pg.mkPen(color="k"))
+        self.plot_widget.getAxis("left").setTextPen(pg.mkPen(color="k"))
+        self.plot_curve = self.plot_widget.plot([], [], pen=pg.mkPen(color=(15, 70, 200), width=2), symbol="o")
 
-        ttk.Label(alarm_frame, text="Email sender:").grid(row=8, column=0, sticky="w")
-        self.sender_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.sender_var, width=24).grid(
-            row=8, column=1, columnspan=2, sticky="ew"
-        )
+        self.status_log_group = QGroupBox("Status Log")
+        status_layout = QVBoxLayout(self.status_log_group)
+        self.status_text = QPlainTextEdit()
+        self.status_text.setReadOnly(True)
+        status_layout.addWidget(self.status_text)
 
-        ttk.Label(alarm_frame, text="SMTP server:").grid(row=9, column=0, sticky="w")
-        self.smtp_server_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.smtp_server_var, width=24).grid(
-            row=9, column=1, columnspan=2, sticky="ew"
-        )
+        readout_layout.addWidget(self.current_value_label)
+        readout_layout.addWidget(self.status_label)
+        readout_layout.addWidget(self.gemini_cost_label)
+        readout_layout.addWidget(self.plot_widget, 1)
+        readout_layout.addWidget(self.status_log_group)
 
-        ttk.Label(alarm_frame, text="SMTP port:").grid(row=10, column=0, sticky="w")
-        self.smtp_port_var = tk.StringVar(value="587")
-        ttk.Entry(alarm_frame, textvariable=self.smtp_port_var, width=10).grid(
-            row=10, column=1, sticky="w"
-        )
+        left_layout.addWidget(self.camera_group)
+        left_layout.addWidget(self.alarm_group)
+        left_layout.addStretch(1)
+        right_layout.addWidget(self.readout_group)
 
-        ttk.Label(alarm_frame, text="SMTP user:").grid(row=11, column=0, sticky="w")
-        self.smtp_user_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.smtp_user_var, width=24).grid(
-            row=11, column=1, columnspan=2, sticky="ew"
-        )
+        self.setCentralWidget(central)
 
-        ttk.Label(alarm_frame, text="SMTP password:").grid(row=12, column=0, sticky="w")
-        self.smtp_pass_var = tk.StringVar()
-        ttk.Entry(alarm_frame, textvariable=self.smtp_pass_var, width=24, show="*").grid(
-            row=12, column=1, columnspan=2, sticky="ew"
-        )
+    def _build_email_dialog(self) -> None:
+        self.email_dialog = QDialog(self)
+        self.email_dialog.setWindowTitle("Email Settings")
+        self.email_dialog.setModal(True)
 
-        self.smtp_tls_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            alarm_frame, text="Use TLS", variable=self.smtp_tls_var
-        ).grid(row=13, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        layout = QVBoxLayout(self.email_dialog)
+        form = QFormLayout()
 
-        config_row = ttk.Frame(alarm_frame)
-        config_row.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        ttk.Button(config_row, text="Load Config", command=self._load_config).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        ttk.Button(config_row, text="Save Config", command=self._save_config).grid(
-            row=0, column=1
-        )
+        self.email_recipient_edit = QLineEdit()
+        self.email_recipient_edit.setPlaceholderText("user1@example.com; user2@example.com")
+        self.email_sender_edit = QLineEdit()
+        self.smtp_server_edit = QLineEdit()
+        self.smtp_port_spin = QSpinBox()
+        self.smtp_port_spin.setRange(1, 65535)
+        self.smtp_port_spin.setValue(587)
+        self.smtp_user_edit = QLineEdit()
+        self.smtp_password_edit = QLineEdit()
+        self.smtp_password_edit.setEchoMode(QLineEdit.Password)
+        self.smtp_tls_check = QCheckBox("Use TLS")
+        self.smtp_tls_check.setChecked(True)
 
-        button_row = ttk.Frame(alarm_frame)
-        button_row.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        ttk.Button(button_row, text="Start", command=self._start_monitoring).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        ttk.Button(button_row, text="Stop", command=self._stop_monitoring).grid(
-            row=0, column=1
-        )
+        form.addRow("Recipient(s)", self.email_recipient_edit)
+        form.addRow("Sender", self.email_sender_edit)
+        form.addRow("SMTP server", self.smtp_server_edit)
+        form.addRow("SMTP port", self.smtp_port_spin)
+        form.addRow("SMTP user", self.smtp_user_edit)
+        form.addRow("SMTP password", self.smtp_password_edit)
+        form.addRow("", self.smtp_tls_check)
 
-    def _build_reading_panel(self, parent: ttk.Frame) -> None:
-        reading_frame = ttk.LabelFrame(parent, text="Pressure Reading", padding=10)
-        reading_frame.grid(row=0, column=0, sticky="nsew")
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        reading_frame.columnconfigure(0, weight=1)
-        reading_frame.rowconfigure(3, weight=1)
+        layout.addLayout(form)
 
-        self.current_value_label = ttk.Label(
-            reading_frame, text="--", style="Value.TLabel"
-        )
-        self.current_value_label.grid(row=0, column=0, sticky="w")
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.email_dialog.close)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
 
-        self.status_label = ttk.Label(reading_frame, text="Idle", style="Secondary.TLabel")
-        self.status_label.grid(row=1, column=0, sticky="w", pady=(6, 4))
+    def _open_email_settings_dialog(self) -> None:
+        self.email_dialog.show()
+        self.email_dialog.raise_()
+        self.email_dialog.activateWindow()
 
-        self.gemini_cost_label = ttk.Label(
-            reading_frame, text="Gemini total cost (since start): $0.000000"
-        )
-        self.gemini_cost_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
-
-        self.figure = Figure(figsize=(6, 3), dpi=100, facecolor=SECTION_BG)
-        self.axis = self.figure.add_subplot(111)
-        self.axis.set_facecolor("#FFFFFF")
-        self.axis.set_xlabel("Time")
-        self.axis.set_ylabel("Pressure")
-        self.axis.grid(True)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=reading_frame)
-        self.canvas.get_tk_widget().grid(row=3, column=0, sticky="nsew", pady=(4, 8))
-
-        status_frame = ttk.LabelFrame(reading_frame, text="Status Log")
-        status_frame.grid(row=4, column=0, sticky="nsew")
-        status_frame.columnconfigure(0, weight=1)
-        status_frame.rowconfigure(0, weight=1)
-        self.status_text = tk.Text(status_frame, height=6, state="disabled")
-        self.status_text.grid(row=0, column=0, sticky="nsew")
-        self.status_text.configure(
-            bg=STATUS_BG,
-            fg=STATUS_FG,
-            insertbackground=STATUS_FG,
-            relief="solid",
-            borderwidth=1,
-            font=("Consolas", 10),
-        )
+    def _on_remember_key_toggled(self, checked: bool) -> None:
+        if checked:
+            self._load_gemini_api_key_from_keyring()
 
     def _refresh_cameras(self) -> None:
-        available = []
+        available: list[str] = []
         for index in range(6):
             capture = cv2.VideoCapture(index)
             if capture.isOpened():
@@ -352,128 +314,32 @@ class PressureMonitorApp:
 
         if not available:
             available = ["0"]
-            self.camera_status.configure(text="No camera detected. Defaulting to 0.")
+            self.camera_status.setText("No camera detected. Defaulting to 0.")
         else:
-            self.camera_status.configure(text=f"Detected cameras: {', '.join(available)}")
+            self.camera_status.setText(f"Detected cameras: {', '.join(available)}")
 
-        self.camera_combo["values"] = available
-        if self.camera_var.get() not in available:
-            self.camera_var.set(available[0])
+        current = self.camera_combo.currentText()
+        self.camera_combo.clear()
+        self.camera_combo.addItems(available)
+        if current in available:
+            self.camera_combo.setCurrentText(current)
 
-    def _browse_reading_log_file(self) -> None:
-        selected = filedialog.asksaveasfilename(
-            title="Select Reading Log File",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=os.path.basename(self.reading_log_var.get() or CSV_NAME),
+    def _browse_log_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Log Folder",
+            self.log_folder_edit.text().strip() or str(DEFAULT_LOG_DIR),
         )
-        if selected:
-            self.reading_log_var.set(selected)
-
-    def _browse_status_log_file(self) -> None:
-        selected = filedialog.asksaveasfilename(
-            title="Select Status Log File",
-            defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")],
-            initialfile=os.path.basename(self.status_log_var.get() or STATUS_LOG_NAME),
-        )
-        if selected:
-            self.status_log_var.set(selected)
-
-    def _save_config(self) -> None:
-        selected = filedialog.asksaveasfilename(
-            title="Save Monitor Config",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            initialfile=os.path.basename(self.config_path),
-        )
-        if not selected:
-            return
-        payload = self._build_config_payload()
-        self._ensure_parent_dir(selected)
-        with open(selected, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        self.config_path = selected
-        self._log_status("Config saved (includes Gemini API key in plain text).")
-
-    def _load_config(self) -> None:
-        selected = filedialog.askopenfilename(
-            title="Load Monitor Config",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if not selected:
-            return
-        self._load_config_from_path(selected, silent=False)
-
-    def _load_config_from_path(self, path: str, silent: bool) -> None:
-        if not os.path.exists(path):
-            if not silent:
-                messagebox.showerror("Config error", f"Config file not found: {path}")
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            self._apply_config_payload(payload)
-            self.config_path = path
-            if not silent:
-                self._log_status(f"Config loaded from {path}")
-        except Exception as exc:
-            if not silent:
-                messagebox.showerror("Config error", f"Failed to load config:\n{exc}")
-
-    def _build_config_payload(self) -> dict[str, object]:
-        return {
-            "camera_index": self.camera_var.get().strip(),
-            "ocr_method": self.ocr_method_var.get().strip(),
-            "gemini_api_key": self.gemini_api_key_var.get(),
-            "reading_log_file": self.reading_log_var.get().strip(),
-            "status_log_file": self.status_log_var.get().strip(),
-            "interval_minutes": self.interval_var.get().strip(),
-            "alarm_enabled": self.alarm_enabled_var.get(),
-            "beep_alarm_enabled": self.beep_alarm_var.get(),
-            "email_alarm_enabled": self.email_alarm_var.get(),
-            "low_threshold": self.low_var.get().strip(),
-            "high_threshold": self.high_var.get().strip(),
-            "recipient": self.recipient_var.get().strip(),
-            "sender": self.sender_var.get().strip(),
-            "smtp_server": self.smtp_server_var.get().strip(),
-            "smtp_port": self.smtp_port_var.get().strip(),
-            "smtp_username": self.smtp_user_var.get().strip(),
-            "smtp_password": self.smtp_pass_var.get(),
-            "smtp_use_tls": self.smtp_tls_var.get(),
-        }
-
-    def _apply_config_payload(self, payload: dict[str, object]) -> None:
-        camera_index = str(payload.get("camera_index", self.camera_var.get()))
-        if camera_index:
-            self.camera_var.set(camera_index)
-        ocr_method = str(payload.get("ocr_method", self.ocr_method_var.get()))
-        if ocr_method in OCR_METHODS:
-            self.ocr_method_var.set(ocr_method)
-        self.gemini_api_key_var.set(str(payload.get("gemini_api_key", self.gemini_api_key_var.get())))
-        self.reading_log_var.set(str(payload.get("reading_log_file", self.reading_log_var.get())))
-        self.status_log_var.set(str(payload.get("status_log_file", self.status_log_var.get())))
-        self.interval_var.set(str(payload.get("interval_minutes", self.interval_var.get())))
-        self.alarm_enabled_var.set(bool(payload.get("alarm_enabled", self.alarm_enabled_var.get())))
-        self.beep_alarm_var.set(bool(payload.get("beep_alarm_enabled", self.beep_alarm_var.get())))
-        self.email_alarm_var.set(bool(payload.get("email_alarm_enabled", self.email_alarm_var.get())))
-        self.low_var.set(str(payload.get("low_threshold", self.low_var.get())))
-        self.high_var.set(str(payload.get("high_threshold", self.high_var.get())))
-        self.recipient_var.set(str(payload.get("recipient", self.recipient_var.get())))
-        self.sender_var.set(str(payload.get("sender", self.sender_var.get())))
-        self.smtp_server_var.set(str(payload.get("smtp_server", self.smtp_server_var.get())))
-        self.smtp_port_var.set(str(payload.get("smtp_port", self.smtp_port_var.get())))
-        self.smtp_user_var.set(str(payload.get("smtp_username", self.smtp_user_var.get())))
-        self.smtp_pass_var.set(str(payload.get("smtp_password", self.smtp_pass_var.get())))
-        self.smtp_tls_var.set(bool(payload.get("smtp_use_tls", self.smtp_tls_var.get())))
+        if folder:
+            self.log_folder_edit.setText(folder)
 
     def _test_camera(self) -> None:
-        self._log_status("Testing camera capture...")
         self._update_status("Testing camera")
+        self._log_status("Testing camera capture...")
         try:
             image_path, temp_path = self._capture_photo(keep_photo=True)
         except Exception as exc:
-            messagebox.showerror("Camera error", str(exc))
+            QMessageBox.critical(self, "Camera error", str(exc))
             self._update_status("Camera test failed")
             return
         finally:
@@ -482,138 +348,149 @@ class PressureMonitorApp:
                     os.remove(temp_path)
                 except OSError:
                     pass
+
         self._update_status("Camera test passed")
         self._log_status(f"Camera test capture saved to {image_path}")
-        messagebox.showinfo("Camera test", f"Capture successful.\nSaved to {image_path}.")
+        QMessageBox.information(self, "Camera test", f"Capture successful.\nSaved to {image_path}.")
 
     def _test_ocr(self) -> None:
         method = self._selected_ocr_method()
-        self._log_status(f"Testing OCR ({method})...")
         self._update_status("Testing OCR")
+        self._log_status(f"Testing OCR ({method})...")
         try:
-            reading, request_cost = self._capture_and_ocr(keep_photo=True)
+            value, request_cost = self._capture_and_ocr(keep_photo=True)
         except Exception as exc:
-            messagebox.showerror(
+            QMessageBox.critical(
+                self,
                 "OCR test error",
                 f"{exc}\n\nLast capture saved to data/last_capture.jpg (if available).",
             )
             self._update_status("OCR test failed")
             return
-        self._update_status(f"OCR test OK: {reading:.2f}")
+
+        self._update_status(f"OCR test OK: {value:.2f}")
         if method == OCR_METHOD_GEMINI and request_cost is not None:
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "OCR test",
-                f"Pressure reading: {reading:.2f}\nEstimated request cost: ${request_cost:.6f}",
+                f"Pressure reading: {value:.2f}\nEstimated request cost: ${request_cost:.6f}",
             )
         else:
-            messagebox.showinfo("OCR test", f"Pressure reading: {reading:.2f}")
+            QMessageBox.information(self, "OCR test", f"Pressure reading: {value:.2f}")
 
     def _start_monitoring(self) -> None:
-        interval = self._interval_minutes()
-        if interval is None:
+        if self.monitoring:
             return
-        if interval < MIN_INTERVAL_MINUTES:
-            messagebox.showerror(
+
+        if self.interval_spin.value() < MIN_INTERVAL_MINUTES:
+            QMessageBox.critical(
+                self,
                 "Invalid interval",
                 f"Minimum interval is {MIN_INTERVAL_MINUTES} minutes.",
             )
             return
 
-        if not os.path.exists(DATA_DIR):
-            os.makedirs(DATA_DIR)
-        self._ensure_parent_dir(self.reading_log_var.get().strip() or self.reading_log_path)
-        self._ensure_parent_dir(self.status_log_var.get().strip() or self.status_log_path)
+        self._persist_gemini_api_key_to_keyring()
+        self._start_new_log_files()
+
+        self.time_data = []
+        self.value_data = []
+        self.plot_curve.setData([], [])
+        self.last_alarm_active = False
         self.gemini_total_cost_usd = 0.0
         self._update_gemini_cost_label()
 
         self.monitoring = True
         self._update_status("Monitoring started")
-        self._schedule_next_run(initial=True)
+        self._log_status("Monitoring started")
+
+        # Immediate first run, then periodic runs.
+        self._run_cycle()
+        self.timer.start(self.interval_spin.value() * 60 * 1000)
 
     def _stop_monitoring(self) -> None:
-        self.monitoring = False
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-            self.after_id = None
-        self._update_status("Monitoring stopped")
-
-    def _interval_minutes(self) -> int | None:
-        try:
-            return int(self.interval_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid interval", "Interval must be an integer.")
-            return None
-
-    def _schedule_next_run(self, initial: bool = False) -> None:
         if not self.monitoring:
             return
-        interval = self._interval_minutes()
-        if interval is None:
-            return
-        interval = max(MIN_INTERVAL_MINUTES, interval)
 
-        delay_ms = 1000 if initial else interval * 60 * 1000
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-        self.after_id = self.root.after(delay_ms, self._run_cycle)
+        self.timer.stop()
+        self.monitoring = False
+        self._update_status("Monitoring stopped")
+        self._log_status("Monitoring stopped")
+        self.active_reading_log_path = None
+        self.active_status_log_path = None
+
+    def _start_new_log_files(self) -> None:
+        folder = Path(self.log_folder_edit.text().strip() or str(DEFAULT_LOG_DIR))
+        folder.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        self.active_reading_log_path = folder / f"pressure_log_{timestamp}.csv"
+        self.active_status_log_path = folder / f"pressure_status_{timestamp}.log"
+
+        with self.active_reading_log_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["timestamp", "pressure"])
+
+        with self.active_status_log_path.open("w", encoding="utf-8"):
+            pass
 
     def _run_cycle(self) -> None:
         if not self.monitoring:
             return
+
         self._update_status("Capturing photo")
         try:
-            value, request_cost = self._capture_and_ocr()
+            value, request_cost = self._capture_and_ocr(keep_photo=False)
         except Exception as exc:
             self._update_status("OCR error")
-            messagebox.showerror("OCR error", str(exc))
             self._log_status(f"OCR error: {exc}")
-            self._schedule_next_run()
+            QMessageBox.critical(self, "OCR error", str(exc))
             return
 
-        if value is not None:
-            self._record_value(value)
-            if self._selected_ocr_method() == OCR_METHOD_GEMINI and request_cost is not None:
-                self.gemini_total_cost_usd += request_cost
-                self._update_gemini_cost_label()
-            self._check_alarm(value)
-        self._schedule_next_run()
+        self._record_value(value)
+
+        if self._selected_ocr_method() == OCR_METHOD_GEMINI and request_cost is not None:
+            self.gemini_total_cost_usd += request_cost
+            self._update_gemini_cost_label()
+
+        self._check_alarm(value)
 
     def _selected_ocr_method(self) -> str:
-        method = self.ocr_method_var.get().strip()
+        method = self.ocr_method_combo.currentText().strip()
         if method not in OCR_METHODS:
             return OCR_METHOD_LOCAL
         return method
 
-    def _capture_photo(self, keep_photo: bool = False) -> tuple[str, str | None]:
-        camera_index = int(self.camera_var.get())
+    def _capture_photo(self, keep_photo: bool) -> tuple[str, str | None]:
+        camera_index = int(self.camera_combo.currentText() or "0")
         capture = cv2.VideoCapture(camera_index)
         if not capture.isOpened():
             raise RuntimeError(f"Unable to open camera index {camera_index}")
+
         success, frame = capture.read()
         capture.release()
         if not success:
             raise RuntimeError("Unable to capture photo from camera")
 
-        timestamp = dt.datetime.now()
-        self._log_status(f"Photo captured at {timestamp:%Y-%m-%d %H:%M:%S}")
+        now = dt.datetime.now()
+        self._log_status(f"Photo captured at {now:%Y-%m-%d %H:%M:%S}")
 
         temp_path = None
         if keep_photo:
-            if not os.path.exists(DATA_DIR):
-                os.makedirs(DATA_DIR)
-            image_path = os.path.join(DATA_DIR, "last_capture.jpg")
-            cv2.imwrite(image_path, frame)
-        else:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-                temp_path = temp_file.name
-            cv2.imwrite(temp_path, frame)
-            image_path = temp_path
-        return image_path, temp_path
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            image_path = DATA_DIR / "last_capture.jpg"
+            cv2.imwrite(str(image_path), frame)
+            return str(image_path), None
 
-    def _capture_and_ocr(self, keep_photo: bool = False) -> tuple[float, float | None]:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_path = temp_file.name
+        cv2.imwrite(temp_path, frame)
+        return temp_path, temp_path
+
+    def _capture_and_ocr(self, keep_photo: bool) -> tuple[float, float | None]:
         image_path, temp_path = self._capture_photo(keep_photo=keep_photo)
-
         self._update_status("Running OCR")
+
         request_cost_usd: float | None = None
         try:
             method = self._selected_ocr_method()
@@ -629,18 +506,22 @@ class PressureMonitorApp:
                         "Gemini OCR dependencies are unavailable: "
                         f"{_GEMINI_IMPORT_ERROR}"
                     )
-                api_key = self.gemini_api_key_var.get().strip() or os.getenv("GEMINI_API_KEY")
+
+                api_key = self.gemini_api_key_edit.text().strip() or os.getenv("GEMINI_API_KEY")
                 if not api_key:
                     raise RuntimeError(
-                        "Gemini API key is missing. Enter it in the GUI field or set GEMINI_API_KEY."
+                        "Gemini API key is missing. Enter it in the GUI field, "
+                        "enable secure storage, or set GEMINI_API_KEY."
                     )
+
                 result = read_gemini_ocr(
-                    image_path=image_path,
+                    image_path=Path(image_path),
                     api_key=api_key,
                     model=GEMINI_DEFAULT_MODEL,
                 )
                 if result.pressure is None:
                     raise RuntimeError("Gemini OCR returned no pressure value.")
+
                 value = float(result.pressure)
                 request_cost_usd = result.estimated_cost_usd
                 self._log_status(
@@ -663,41 +544,24 @@ class PressureMonitorApp:
 
     def _record_value(self, value: float) -> None:
         now = dt.datetime.now()
-        self.timestamps.append(now)
-        self.values.append(value)
-        self.current_value_label.configure(text=f"{value:.2f}")
-        self._update_plot()
-        self._append_csv(now, value)
+        epoch_ts = now.timestamp()
+        self.time_data.append(epoch_ts)
+        self.value_data.append(value)
+
+        self.plot_curve.setData(self.time_data, self.value_data)
+        self.current_value_label.setText(f"{value:.2f}")
+        self._append_reading_log(now, value)
         self._update_status("Reading captured")
 
-    def _append_csv(self, timestamp: dt.datetime, value: float) -> None:
-        path = self.reading_log_var.get().strip() or self.reading_log_path
-        self._ensure_parent_dir(path)
-        new_file = not os.path.exists(path)
-        with open(path, "a", newline="", encoding="utf-8") as handle:
+    def _append_reading_log(self, timestamp: dt.datetime, value: float) -> None:
+        if self.active_reading_log_path is None:
+            return
+        with self.active_reading_log_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            if new_file:
-                writer.writerow(["timestamp", "pressure"])
             writer.writerow([timestamp.isoformat(), f"{value:.2f}"])
 
-    def _update_plot(self) -> None:
-        self.axis.clear()
-        self.axis.grid(True)
-        if self.timestamps:
-            self.axis.plot(self.timestamps, self.values, marker="o", linestyle="-")
-            self.axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M:%S"))
-            self.figure.autofmt_xdate(rotation=25, ha="right")
-        self.axis.set_xlabel("Time")
-        self.axis.set_ylabel("Pressure")
-        self.canvas.draw()
-
     def _check_alarm(self, value: float) -> None:
-        try:
-            config = self._alarm_config()
-        except ValueError as exc:
-            messagebox.showerror("Invalid alarm settings", str(exc))
-            self._log_status(f"Alarm config error: {exc}")
-            return
+        config = self._alarm_config()
         if not config.enabled:
             self.last_alarm_active = False
             return
@@ -708,52 +572,45 @@ class PressureMonitorApp:
 
         if alarm_active and not self.last_alarm_active:
             if config.beep_enabled:
-                self.root.bell()
+                QApplication.beep()
                 self._log_status(f"Beep alarm triggered at pressure={value:.2f}")
             if config.email_enabled:
                 self._send_alarm_email(config, value)
             if not config.beep_enabled and not config.email_enabled:
                 self._log_status("Alarm triggered but both beep/email alarms are disabled.")
+
         self.last_alarm_active = alarm_active
 
     def _alarm_config(self) -> AlarmConfig:
-        def parse_optional(value: str) -> float | None:
-            value = value.strip()
-            if not value:
-                return None
-            try:
-                return float(value)
-            except ValueError as exc:
-                raise ValueError(f"Invalid threshold value: {value}") from exc
+        low = float(self.low_threshold_spin.value()) if self.low_enabled_check.isChecked() else None
+        high = float(self.high_threshold_spin.value()) if self.high_enabled_check.isChecked() else None
 
-        low = parse_optional(self.low_var.get())
-        high = parse_optional(self.high_var.get())
-        port_raw = self.smtp_port_var.get().strip()
-        try:
-            smtp_port = int(port_raw) if port_raw else 0
-        except ValueError as exc:
-            raise ValueError(f"Invalid SMTP port value: {port_raw}") from exc
         return AlarmConfig(
-            enabled=self.alarm_enabled_var.get(),
-            beep_enabled=self.beep_alarm_var.get(),
-            email_enabled=self.email_alarm_var.get(),
+            enabled=self.alarm_enabled_check.isChecked(),
             low_threshold=low,
             high_threshold=high,
-            recipient=self.recipient_var.get().strip(),
-            sender=self.sender_var.get().strip(),
-            smtp_server=self.smtp_server_var.get().strip(),
-            smtp_port=smtp_port,
-            username=self.smtp_user_var.get().strip(),
-            password=self.smtp_pass_var.get().strip(),
-            use_tls=self.smtp_tls_var.get(),
+            beep_enabled=self.beep_alarm_check.isChecked(),
+            email_enabled=self.email_alarm_check.isChecked(),
+            recipient_text=self.email_recipient_edit.text().strip(),
+            sender=self.email_sender_edit.text().strip(),
+            smtp_server=self.smtp_server_edit.text().strip(),
+            smtp_port=int(self.smtp_port_spin.value()),
+            username=self.smtp_user_edit.text().strip(),
+            password=self.smtp_password_edit.text(),
+            use_tls=self.smtp_tls_check.isChecked(),
         )
 
+    @staticmethod
+    def _parse_recipients(text: str) -> list[str]:
+        parts = re.split(r"[;,\n]+", text)
+        return [part.strip() for part in parts if part.strip()]
+
     def _send_alarm_email(self, config: AlarmConfig, value: float) -> None:
-        if not config.recipient or not config.sender or not config.smtp_server:
+        recipients = self._parse_recipients(config.recipient_text)
+        if not recipients or not config.sender or not config.smtp_server:
             self._log_status("Alarm triggered but email settings are incomplete.")
             return
 
-        subject = "HRC-110 Pressure Alarm"
         body = (
             "Pressure alarm triggered.\n"
             f"Pressure value: {value:.2f}\n"
@@ -761,23 +618,21 @@ class PressureMonitorApp:
         )
 
         message = EmailMessage()
-        message["Subject"] = subject
+        message["Subject"] = "HRC-110 Pressure Alarm"
         message["From"] = config.sender
-        message["To"] = config.recipient
+        message["To"] = ", ".join(recipients)
         message.set_content(body)
 
         context = ssl.create_default_context()
         try:
             if config.use_tls:
-                with smtplib.SMTP(config.smtp_server, config.smtp_port) as server:
+                with smtplib.SMTP(config.smtp_server, config.smtp_port, timeout=20) as server:
                     server.starttls(context=context)
                     if config.username:
                         server.login(config.username, config.password)
                     server.send_message(message)
             else:
-                with smtplib.SMTP_SSL(
-                    config.smtp_server, config.smtp_port, context=context
-                ) as server:
+                with smtplib.SMTP_SSL(config.smtp_server, config.smtp_port, context=context, timeout=20) as server:
                     if config.username:
                         server.login(config.username, config.password)
                     server.send_message(message)
@@ -786,46 +641,191 @@ class PressureMonitorApp:
             self._log_status(f"Alarm email failed: {exc}")
 
     def _update_status(self, text: str) -> None:
-        self.status_label.configure(text=text)
+        self.status_label.setText(text)
 
     def _update_gemini_cost_label(self) -> None:
         if self._selected_ocr_method() == OCR_METHOD_GEMINI:
-            text = f"Gemini total cost (since start): ${self.gemini_total_cost_usd:.6f}"
+            self.gemini_cost_label.setText(
+                f"Gemini total cost (since start): ${self.gemini_total_cost_usd:.6f}"
+            )
         else:
-            text = "Gemini total cost (since start): n/a (Local OCR selected)"
-        self.gemini_cost_label.configure(text=text)
+            self.gemini_cost_label.setText("Gemini total cost (since start): n/a (Local OCR selected)")
 
-    @staticmethod
-    def _ensure_parent_dir(path: str) -> None:
-        parent = os.path.dirname(path)
-        if parent and not os.path.exists(parent):
-            os.makedirs(parent, exist_ok=True)
-
-    def _append_status_log(self, timestamp: dt.datetime, text: str) -> None:
-        path = self.status_log_var.get().strip() or self.status_log_path
-        self._ensure_parent_dir(path)
-        with open(path, "a", encoding="utf-8") as handle:
+    def _append_status_log_file(self, timestamp: dt.datetime, text: str) -> None:
+        if self.active_status_log_path is None:
+            return
+        with self.active_status_log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"{timestamp.isoformat()} {text}\n")
 
     def _log_status(self, text: str) -> None:
         now = dt.datetime.now()
-        timestamp = now.strftime("%H:%M:%S")
-        self.status_text.configure(state="normal")
-        self.status_text.insert("end", f"[{timestamp}] {text}\n")
-        self.status_text.configure(state="disabled")
-        self.status_text.see("end")
-        self._append_status_log(now, text)
+        line = f"[{now:%H:%M:%S}] {text}"
+        self.status_text.appendPlainText(line)
+        self._append_status_log_file(now, text)
+
+    def _build_config_payload(self) -> dict[str, object]:
+        return {
+            "camera_index": self.camera_combo.currentText(),
+            "ocr_method": self._selected_ocr_method(),
+            "remember_gemini_api_key": self.remember_key_check.isChecked(),
+            "log_folder": self.log_folder_edit.text().strip(),
+            "interval_minutes": int(self.interval_spin.value()),
+            "alarm_enabled": self.alarm_enabled_check.isChecked(),
+            "low_enabled": self.low_enabled_check.isChecked(),
+            "low_threshold": float(self.low_threshold_spin.value()),
+            "high_enabled": self.high_enabled_check.isChecked(),
+            "high_threshold": float(self.high_threshold_spin.value()),
+            "beep_alarm_enabled": self.beep_alarm_check.isChecked(),
+            "email_alarm_enabled": self.email_alarm_check.isChecked(),
+            "email_recipients": self.email_recipient_edit.text().strip(),
+            "email_sender": self.email_sender_edit.text().strip(),
+            "smtp_server": self.smtp_server_edit.text().strip(),
+            "smtp_port": int(self.smtp_port_spin.value()),
+            "smtp_user": self.smtp_user_edit.text().strip(),
+            "smtp_password": self.smtp_password_edit.text(),
+            "smtp_use_tls": self.smtp_tls_check.isChecked(),
+        }
+
+    def _apply_config_payload(self, payload: dict[str, object]) -> None:
+        camera_index = str(payload.get("camera_index", "")).strip()
+        if camera_index:
+            idx = self.camera_combo.findText(camera_index)
+            if idx >= 0:
+                self.camera_combo.setCurrentIndex(idx)
+
+        ocr_method = str(payload.get("ocr_method", OCR_METHOD_LOCAL))
+        idx = self.ocr_method_combo.findText(ocr_method)
+        if idx >= 0:
+            self.ocr_method_combo.setCurrentIndex(idx)
+
+        remember = bool(payload.get("remember_gemini_api_key", False))
+        self.remember_key_check.setChecked(remember)
+        if remember:
+            self._load_gemini_api_key_from_keyring()
+        else:
+            self.gemini_api_key_edit.setText("")
+
+        self.log_folder_edit.setText(str(payload.get("log_folder", str(DEFAULT_LOG_DIR))))
+        self.interval_spin.setValue(max(MIN_INTERVAL_MINUTES, int(payload.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))))
+
+        self.alarm_enabled_check.setChecked(bool(payload.get("alarm_enabled", False)))
+        self.low_enabled_check.setChecked(bool(payload.get("low_enabled", False)))
+        self.low_threshold_spin.setValue(float(payload.get("low_threshold", 0.0)))
+        self.high_enabled_check.setChecked(bool(payload.get("high_enabled", False)))
+        self.high_threshold_spin.setValue(float(payload.get("high_threshold", 0.0)))
+        self.beep_alarm_check.setChecked(bool(payload.get("beep_alarm_enabled", True)))
+        self.email_alarm_check.setChecked(bool(payload.get("email_alarm_enabled", False)))
+
+        self.email_recipient_edit.setText(str(payload.get("email_recipients", "")))
+        self.email_sender_edit.setText(str(payload.get("email_sender", "")))
+        self.smtp_server_edit.setText(str(payload.get("smtp_server", "")))
+        self.smtp_port_spin.setValue(int(payload.get("smtp_port", 587)))
+        self.smtp_user_edit.setText(str(payload.get("smtp_user", "")))
+        self.smtp_password_edit.setText(str(payload.get("smtp_password", "")))
+        self.smtp_tls_check.setChecked(bool(payload.get("smtp_use_tls", True)))
+
+        self._update_gemini_cost_label()
+
+    def _save_config(self) -> None:
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Config",
+            str(self.config_path),
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not selected:
+            return
+
+        payload = self._build_config_payload()
+        path = Path(selected)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.config_path = path
+        self._persist_gemini_api_key_to_keyring()
+        self._log_status(f"Config saved to {path}")
+
+    def _load_config(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Config",
+            str(self.config_path.parent),
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not selected:
+            return
+        self._load_config_from_path(Path(selected), silent=False)
+
+    def _load_config_from_path(self, path: Path, silent: bool) -> None:
+        if not path.exists():
+            if not silent:
+                QMessageBox.critical(self, "Config error", f"Config file not found: {path}")
+            return
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Config root must be a JSON object")
+            self._apply_config_payload(payload)
+            self.config_path = path
+            if not silent:
+                self._log_status(f"Config loaded from {path}")
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "Config error", f"Failed to load config:\n{exc}")
+
+    def _load_gemini_api_key_from_keyring(self) -> None:
+        if keyring is None or not self.remember_key_check.isChecked():
+            return
+        try:
+            stored = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
+        except Exception:
+            stored = None
+        if stored:
+            self.gemini_api_key_edit.setText(stored)
+
+    def _persist_gemini_api_key_to_keyring(self) -> None:
+        if keyring is None:
+            if self.remember_key_check.isChecked():
+                self._log_status("keyring unavailable; Gemini API key not persisted securely")
+            return
+
+        api_key = self.gemini_api_key_edit.text().strip()
+        if self.remember_key_check.isChecked() and api_key:
+            try:
+                keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, api_key)
+            except Exception:
+                self._log_status("Failed to save Gemini API key to keyring")
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+            except Exception:
+                pass
+
+    def _save_default_config_on_exit(self) -> None:
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config_path.write_text(
+                json.dumps(self._build_config_payload(), indent=2), encoding="utf-8"
+            )
+            self._persist_gemini_api_key_to_keyring()
+        except Exception:
+            # Exit path should not block app close.
+            pass
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt naming
+        self._stop_monitoring()
+        self._save_default_config_on_exit()
+        event.accept()
 
 
-def main() -> None:
-    root = tk.Tk()
-    style = ttk.Style(root)
-    if "clam" in style.theme_names():
-        style.theme_use("clam")
-    app = PressureMonitorApp(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app._stop_monitoring(), root.destroy()))
-    root.mainloop()
+def main() -> int:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    app = QApplication([])
+    pg.setConfigOptions(antialias=True)
+    window = PressureMonitorWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
