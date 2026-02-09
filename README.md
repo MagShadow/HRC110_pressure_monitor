@@ -6,14 +6,17 @@ This repository provides a **GUI pressure monitor** modeled after the layout of 
 
 - **SCM10-style layout**
   - Left upper: camera selection + OCR method + separate test buttons
-  - Left lower: alarm thresholds + email setup
+  - Left lower: log file, alarm, and config controls
   - Right: live pressure reading, status, and plot
 - **USB camera capture** → **OCR** → **record + plot**
 - **Selectable OCR backend**: `Local` or `GEMINI`
+- **Separate alarm actions**: `Beep alarm` and `Email alarm`
+- **Config save/load** (including Gemini API key in plain text)
 - **Status updates** (capture time, OCR progress)
 - **Minimum interval enforced (1 minute), default 10 minutes**
 - **Temporary photos auto-deleted after OCR**
 - **OCR error handling** with pop-up notifications (skips bad points)
+- **Automatic logging** to selectable reading/status log files with real timestamps
 
 ## Quick Start
 
@@ -42,10 +45,14 @@ python pressure_monitor_gui.py
 - **Test OCR** captures a photo and runs OCR using the selected backend.
 - **OCR method** can be chosen from `Local` and `GEMINI`.
   - `GEMINI` uses the GUI API key field (or falls back to `GEMINI_API_KEY` if empty).
+- **Gemini cost line** shows cumulative estimated cost since pressing `Start`.
 - **Test captures** are saved to `data/last_capture.jpg` so you can inspect failed OCR images.
 - **Monitoring interval** is in minutes (minimum 1, default 10).
-- **Data logging**: readings are appended to `data/pressure_readings.csv`.
-- **Alarms**: set low/high thresholds and SMTP details to receive alert emails.
+- **Log files** can be selected in the GUI (`Reading log file`, `Status log file`).
+  - Reading log format: CSV with ISO datetime (`timestamp`) and pressure.
+  - Status log format: text lines prefixed with ISO datetime.
+- **Alarms**: set low/high thresholds and independently enable beep and/or email actions.
+- **Save Config / Load Config** stores and restores GUI settings; Gemini API key is stored as plain text in the JSON file.
 - **OCR failures** trigger a pop-up and skip the current data point.
 
 ## OCR Prototype CLI
