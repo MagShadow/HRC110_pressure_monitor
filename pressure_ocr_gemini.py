@@ -124,9 +124,10 @@ def read_gemini_ocr(
     image = Image.open(image_path)
 
     prompt = (
-        "You are reading a digital pressure/temperature display from an HRC-110. "
-        "Return JSON only with keys: pressure, temperature, pressure_unit, temperature_unit. "
-        "Use null for values you cannot read. Pressure is typically in MPa and temperature in °C."
+        "You are reading a digital pressure and temperature display. "
+        "Pressure is the blue numbers (unit is psi); temperature is the red numbers(no unit)."
+        "Return JSON only with 2 keys: pressure, temperature. "
+        "Use null for values you cannot read. "
     )
 
     model_instance = genai.GenerativeModel(model)
@@ -144,8 +145,8 @@ def read_gemini_ocr(
     pressure = _parse_float(payload.get("pressure"))
     temperature = _parse_float(payload.get("temperature"))
 
-    pressure_unit = str(payload.get("pressure_unit") or "MPa")
-    temperature_unit = str(payload.get("temperature_unit") or "C")
+    pressure_unit = str(payload.get("pressure_unit") or "psi")
+    temperature_unit = str(payload.get("temperature_unit") or "K")
 
     usage = getattr(response, "usage_metadata", None)
     prompt_tokens = _usage_token_count(usage, "prompt_token_count")
