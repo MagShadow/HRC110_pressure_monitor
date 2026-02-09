@@ -1,7 +1,8 @@
-# Gemini OCR (experimental)
+# Gemini OCR
 
-This is an alternative OCR path that uses Google Gemini's vision model. It is **not** wired
-into the main application yet, so you can experiment without impacting the current OCR flow.
+Google Gemini vision OCR is available both in:
+- The GUI (`pressure_monitor_gui.py`) via the OCR method selector (`GEMINI`)
+- Standalone scripts for one-off and batch testing
 
 ## Quick start
 

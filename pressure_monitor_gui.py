@@ -18,10 +18,23 @@ import cv2
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from pressure_ocr import read_pressure_temperature
+try:
+    from pressure_ocr_gemini import DEFAULT_MODEL as GEMINI_DEFAULT_MODEL
+    from pressure_ocr_gemini import read_gemini_ocr
+except Exception as exc:  # pragma: no cover - optional runtime dependency
+    read_gemini_ocr = None
+    GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-lite"
+    _GEMINI_IMPORT_ERROR = exc
+else:
+    _GEMINI_IMPORT_ERROR = None
 
-MIN_INTERVAL_MINUTES = 2
+MIN_INTERVAL_MINUTES = 1
+DEFAULT_INTERVAL_MINUTES = 10
 DATA_DIR = "data"
 CSV_NAME = "pressure_readings.csv"
+OCR_METHOD_LOCAL = "Local"
+OCR_METHOD_GEMINI = "GEMINI"
+OCR_METHODS = (OCR_METHOD_LOCAL, OCR_METHOD_GEMINI)
 
 
 @dataclass
@@ -88,12 +101,38 @@ class PressureMonitorApp:
             camera_frame, text="Refresh", command=self._refresh_cameras
         ).grid(row=0, column=2, padx=(5, 0))
 
+        ttk.Label(camera_frame, text="OCR method:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.ocr_method_var = tk.StringVar(value=OCR_METHOD_LOCAL)
+        self.ocr_method_combo = ttk.Combobox(
+            camera_frame,
+            textvariable=self.ocr_method_var,
+            values=OCR_METHODS,
+            state="readonly",
+            width=12,
+        )
+        self.ocr_method_combo.grid(row=1, column=1, padx=(5, 0), pady=(8, 0), sticky="w")
+
+        ttk.Label(camera_frame, text="Gemini API key:").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        self.gemini_api_key_var = tk.StringVar(value=os.getenv("GEMINI_API_KEY", ""))
+        ttk.Entry(
+            camera_frame, textvariable=self.gemini_api_key_var, width=28, show="*"
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=(8, 0))
+
+        test_row = ttk.Frame(camera_frame)
+        test_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        test_row.columnconfigure(0, weight=1)
+        test_row.columnconfigure(1, weight=1)
+        ttk.Button(test_row, text="Test Camera", command=self._test_camera).grid(
+            row=0, column=0, sticky="ew", padx=(0, 3)
+        )
         ttk.Button(
-            camera_frame, text="Test Camera + OCR", command=self._test_camera
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+            test_row, text="Test OCR", command=self._test_ocr
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         self.camera_status = ttk.Label(camera_frame, text="")
-        self.camera_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.camera_status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _build_alarm_panel(self, parent: ttk.Frame) -> None:
         alarm_frame = ttk.LabelFrame(parent, text="Alarm & Email", padding=10)
@@ -103,7 +142,7 @@ class PressureMonitorApp:
         ttk.Label(alarm_frame, text="Interval (minutes):").grid(
             row=0, column=0, sticky="w"
         )
-        self.interval_var = tk.StringVar(value="2")
+        self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MINUTES))
         ttk.Entry(alarm_frame, textvariable=self.interval_var, width=10).grid(
             row=0, column=1, sticky="w"
         )
@@ -230,20 +269,39 @@ class PressureMonitorApp:
             self.camera_var.set(available[0])
 
     def _test_camera(self) -> None:
-        self._log_status("Testing camera...")
+        self._log_status("Testing camera capture...")
         self._update_status("Testing camera")
+        try:
+            image_path, temp_path = self._capture_photo(keep_photo=True)
+        except Exception as exc:
+            messagebox.showerror("Camera error", str(exc))
+            self._update_status("Camera test failed")
+            return
+        finally:
+            if "temp_path" in locals() and temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+        self._update_status("Camera test passed")
+        self._log_status(f"Camera test capture saved to {image_path}")
+        messagebox.showinfo("Camera test", f"Capture successful.\nSaved to {image_path}.")
+
+    def _test_ocr(self) -> None:
+        method = self._selected_ocr_method()
+        self._log_status(f"Testing OCR ({method})...")
+        self._update_status("Testing OCR")
         try:
             reading = self._capture_and_ocr(keep_photo=True)
         except Exception as exc:
             messagebox.showerror(
-                "Camera/OCR error",
+                "OCR test error",
                 f"{exc}\n\nLast capture saved to data/last_capture.jpg (if available).",
             )
-            self._update_status("Camera test failed")
+            self._update_status("OCR test failed")
             return
-        if reading is not None:
-            self._update_status(f"Test OK: {reading:.2f}")
-            messagebox.showinfo("Test result", f"Pressure reading: {reading:.2f}")
+        self._update_status(f"OCR test OK: {reading:.2f}")
+        messagebox.showinfo("OCR test", f"Pressure reading: {reading:.2f}")
 
     def _start_monitoring(self) -> None:
         interval = self._interval_minutes()
@@ -283,6 +341,7 @@ class PressureMonitorApp:
         interval = self._interval_minutes()
         if interval is None:
             return
+        interval = max(MIN_INTERVAL_MINUTES, interval)
 
         delay_ms = 1000 if initial else interval * 60 * 1000
         if self.after_id is not None:
@@ -307,7 +366,13 @@ class PressureMonitorApp:
             self._check_alarm(value)
         self._schedule_next_run()
 
-    def _capture_and_ocr(self, keep_photo: bool = False) -> float | None:
+    def _selected_ocr_method(self) -> str:
+        method = self.ocr_method_var.get().strip()
+        if method not in OCR_METHODS:
+            return OCR_METHOD_LOCAL
+        return method
+
+    def _capture_photo(self, keep_photo: bool = False) -> tuple[str, str | None]:
         camera_index = int(self.camera_var.get())
         capture = cv2.VideoCapture(camera_index)
         if not capture.isOpened():
@@ -321,28 +386,55 @@ class PressureMonitorApp:
         self._log_status(f"Photo captured at {timestamp:%Y-%m-%d %H:%M:%S}")
 
         temp_path = None
-        keep_path = None
         if keep_photo:
             if not os.path.exists(DATA_DIR):
                 os.makedirs(DATA_DIR)
-            keep_path = os.path.join(DATA_DIR, "last_capture.jpg")
-            cv2.imwrite(keep_path, frame)
+            image_path = os.path.join(DATA_DIR, "last_capture.jpg")
+            cv2.imwrite(image_path, frame)
         else:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
                 temp_path = temp_file.name
             cv2.imwrite(temp_path, frame)
+            image_path = temp_path
+        return image_path, temp_path
 
-        image_path = keep_path or temp_path
-        if not image_path:
-            raise RuntimeError("Unable to create capture image")
+    def _capture_and_ocr(self, keep_photo: bool = False) -> float | None:
+        image_path, temp_path = self._capture_photo(keep_photo=keep_photo)
 
         self._update_status("Running OCR")
         try:
-            pressure, _temperature = read_pressure_temperature(image_path)
-            value = float(pressure.value)
-            self._log_status(
-                f"OCR result: {pressure.value} (confidence={pressure.confidence:.2f})"
-            )
+            method = self._selected_ocr_method()
+            if method == OCR_METHOD_LOCAL:
+                pressure, _temperature = read_pressure_temperature(image_path)
+                value = float(pressure.value)
+                self._log_status(
+                    f"Local OCR result: {pressure.value} (confidence={pressure.confidence:.2f})"
+                )
+            elif method == OCR_METHOD_GEMINI:
+                if read_gemini_ocr is None:
+                    raise RuntimeError(
+                        "Gemini OCR dependencies are unavailable: "
+                        f"{_GEMINI_IMPORT_ERROR}"
+                    )
+                api_key = self.gemini_api_key_var.get().strip() or os.getenv("GEMINI_API_KEY")
+                if not api_key:
+                    raise RuntimeError(
+                        "Gemini API key is missing. Enter it in the GUI field or set GEMINI_API_KEY."
+                    )
+                result = read_gemini_ocr(
+                    image_path=image_path,
+                    api_key=api_key,
+                    model=GEMINI_DEFAULT_MODEL,
+                )
+                if result.pressure is None:
+                    raise RuntimeError("Gemini OCR returned no pressure value.")
+                value = float(result.pressure)
+                self._log_status(
+                    f"Gemini OCR result: {value:.2f} "
+                    f"(prompt_tokens={result.prompt_tokens}, output_tokens={result.output_tokens})"
+                )
+            else:
+                raise RuntimeError(f"Unsupported OCR method: {method}")
         finally:
             if temp_path:
                 try:
@@ -350,8 +442,8 @@ class PressureMonitorApp:
                 except OSError:
                     pass
 
-        if keep_path:
-            self._log_status(f"Saved capture to {keep_path}")
+        if keep_photo:
+            self._log_status(f"Saved capture to {image_path}")
 
         return value
 
