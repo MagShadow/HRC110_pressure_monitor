@@ -1,24 +1,18 @@
-# HRC-100/110 Pressure Monitor (CLI Prototype)
+# HRC-100/110 Pressure Monitor (GUI + OCR)
 
-This repository contains a **minimal Python CLI** intended to validate USB connectivity and basic serial communication with a **Helium Recondenser Controller HRC‑100/110** before building the full monitoring/alarm application.
+This repository provides a **GUI pressure monitor** modeled after the layout of the SCM10 temperature monitor, but tailored to **HRC‑100/110** pressure readings captured by a **USB camera** and decoded via OCR.
 
-> **Note on documentation & research:** The environment used to assemble this first step does not allow outbound network access or PDF text extraction tools. The manuals are present in `docs/`, but I cannot extract or search them here. The CLI is therefore configurable for baud rate, parity, stop bits, and payload so you can quickly test and refine parameters once you review the vendor docs locally. See the **Next steps** section for how we’ll fold in the protocol details once you confirm them.
+## Features
 
-## Background & Goal
-
-You asked for an application similar to [`SCM10_temperature_monitor`](https://github.com/MagShadow/SCM10_temperature_monitor) but targeting the **HRC‑100/110 pressure meter**, capable of **monitoring pressure** and **sending alarms**. This first milestone is a **minimal USB-only CLI** that:
-
-- Detects USB serial devices.
-- Opens a selected port with configurable serial parameters.
-- Optionally sends a hex or ASCII payload.
-- Reads back the response so we can confirm communication.
-
-Once communication is verified, we will:
-
-1. Implement the HRC‑100/110 protocol (commands, registers, checksum, etc.).
-2. Add periodic polling for pressure values.
-3. Implement alarm rules and notifications.
-4. Package as a service/daemon and add logging.
+- **SCM10-style layout**
+  - Left upper: camera selection + test OCR
+  - Left lower: alarm thresholds + email setup
+  - Right: live pressure reading, status, and plot
+- **USB camera capture** → **OCR** → **record + plot**
+- **Status updates** (capture time, OCR progress)
+- **Minimum interval enforced (2 minutes)**
+- **Temporary photos auto-deleted after OCR**
+- **OCR error handling** with pop-up notifications (skips bad points)
 
 ## Quick Start
 
@@ -29,75 +23,40 @@ conda env create -f environment.yml
 conda activate hrc110
 ```
 
-If you need to install/update dependencies manually inside the environment:
+Or install with pip:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2) List USB serial devices
+### 2) Launch the GUI monitor
 
 ```bash
-python hrc110_cli.py list
+python pressure_monitor_gui.py
 ```
 
-### 3) Probe a port (USB only)
+## GUI Usage Notes
 
-```bash
-python hrc110_cli.py probe --port /dev/ttyUSB0 --baud 9600 --parity N --stopbits 1 --timeout 1.0
-```
+- **Camera test** captures a photo and runs OCR immediately.
+- **Test captures** are saved to `data/last_capture.jpg` so you can inspect failed OCR images.
+- **Monitoring interval** is in minutes (minimum 2).
+- **Data logging**: readings are appended to `data/pressure_readings.csv`.
+- **Alarms**: set low/high thresholds and SMTP details to receive alert emails.
+- **OCR failures** trigger a pop-up and skip the current data point.
 
-### 4) Send a hex payload (example)
+## OCR Prototype CLI
 
-```bash
-python hrc110_cli.py probe \
-  --port /dev/ttyUSB0 \
-  --baud 9600 \
-  --write-hex "01 03 00 00 00 02 C4 0B" \
-  --read-bytes 64
-```
-
-If you prefer ASCII commands:
-
-```bash
-python hrc110_cli.py probe \
-  --port /dev/ttyUSB0 \
-  --write-ascii "STATUS?\r\n" \
-  --read-bytes 128
-```
-
-## Next Steps (After You Test)
-
-Once you confirm the correct port settings and any working command examples from the HRC‑100/110 manual:
-
-- I will encode the **official protocol** (queries, scaling, unit conversion, checksums).
-- We will add **pressure polling** at a configured interval.
-- We will add **alarm configuration** (thresholds, hysteresis, notifications).
-
-Please share the confirmed **baud rate**, **parity**, **stop bits**, and any **known query commands** (or register map) from the manual so we can implement the proper protocol in the next iteration.
-
-## Photo-Based OCR Prototype
-
-If you have a USB camera pointed at the pressure/temperature displays, you can use the OCR prototype to extract numbers from a snapshot. The implementation uses lightweight HSV color filtering and seven-segment decoding (no GPU required).
-
-### Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### Run on a sample image
+You can still run OCR directly on a photo:
 
 ```bash
 python pressure_ocr.py --image test_photo.jpg
 ```
 
-This prints both pressure (blue digits) and temperature (red digits) with a confidence estimate.
-
 ## Files
 
-- `hrc110_cli.py` — Minimal USB serial CLI for connection testing.
-- `pressure_ocr.py` — Prototype OCR for reading pressure and temperature from a photo.
+- `pressure_monitor_gui.py` — GUI app for monitoring pressure and sending alarms.
+- `pressure_ocr.py` — OCR pipeline for reading pressure/temperature from a photo.
+- `hrc110_cli.py` — USB serial CLI for connection testing.
 - `requirements.txt` — Python dependencies.
 - `environment.yml` — Conda environment definition.
 - `docs/` — Vendor documentation (manuals/appendices).
