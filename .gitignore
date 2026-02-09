@@ -4,6 +4,8 @@ __pycache__/
 *.pyd
 *.egg-info/
 .env
+.env.local
+.env.gemini
 .venv/
 venv/
 .DS_Store
@@ -11,6 +13,7 @@ venv/
 # runtime outputs
 /data/
 *.csv
+gemini_outputs/
 
 # temp images
 *.jpg
