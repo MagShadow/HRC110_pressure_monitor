@@ -19,9 +19,11 @@ else:
     _GENAI_IMPORT_ERROR = None
 
 
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 DEFAULT_INPUT_PRICE_PER_MILLION = 0.35
 DEFAULT_OUTPUT_PRICE_PER_MILLION = 1.05
+DEFAULT_IMAGE_TOKENS_PER_TILE = 258
+DEFAULT_IMAGE_TILE_SIZE = 512
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,17 @@ def _estimate_cost(
     return cost
 
 
+def _estimate_image_prompt_tokens(
+    image: Image.Image,
+    tokens_per_tile: int = DEFAULT_IMAGE_TOKENS_PER_TILE,
+    tile_size: int = DEFAULT_IMAGE_TILE_SIZE,
+) -> int:
+    width, height = image.size
+    tiles_w = (width + tile_size - 1) // tile_size
+    tiles_h = (height + tile_size - 1) // tile_size
+    return int(tiles_w * tiles_h * tokens_per_tile)
+
+
 def read_gemini_ocr(
     image_path: Path,
     api_key: str,
@@ -137,6 +150,8 @@ def read_gemini_ocr(
     usage = getattr(response, "usage_metadata", None)
     prompt_tokens = _usage_token_count(usage, "prompt_token_count")
     output_tokens = _usage_token_count(usage, "candidates_token_count")
+    if prompt_tokens is None:
+        prompt_tokens = _estimate_image_prompt_tokens(image)
     estimated_cost = _estimate_cost(
         prompt_tokens,
         output_tokens,

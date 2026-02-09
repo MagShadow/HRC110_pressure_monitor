@@ -45,6 +45,19 @@ estimated_cost_usd = (prompt_tokens / 1,000,000) * input_price
                    + (output_tokens / 1,000,000) * output_price
 ```
 
-Defaults are set for Gemini 1.5 Flash (input: $0.35 / 1M tokens, output: $1.05 / 1M tokens),
+Defaults are set for Gemini 2.5 Flash Lite (input: $0.35 / 1M tokens, output: $1.05 / 1M tokens),
 which is currently the cheapest generally available vision model. Update the prices with
 `--input-price` and `--output-price` to match the latest pricing or a different model.
+
+### Image-size based cost estimate (fallback)
+
+If the API response does not include token usage, the script estimates prompt tokens from the
+image size. It uses a 512×512 tile size and 258 tokens per tile:
+
+```
+tiles_w = ceil(width / 512)
+tiles_h = ceil(height / 512)
+prompt_tokens ≈ tiles_w * tiles_h * 258
+```
+
+This is an approximation; for exact costs, prefer the token usage returned by the API.
